@@ -200,6 +200,7 @@ def parse_results(results_dir: Path, ligand_id: str, job_id: str) -> Dict[str, A
         result['affinity_data'] = affinity_data
     except Exception as e:
         print(f'Error parsing affinity data: {e}')
+        result['affinity_data'] = None
     
     try:
         structure_files = list(predictions_dir.glob("*.cif")) + list(predictions_dir.glob("*.pdb"))
@@ -208,6 +209,7 @@ def parse_results(results_dir: Path, ligand_id: str, job_id: str) -> Dict[str, A
         result['structure_data'] = structure_data
     except Exception as e:
         print(f'Error parsing structure data: {e}')
+        result['structure_data'] = None
     
     try:
         confidence_file = str(list(predictions_dir.glob("confidence*.json"))[0])
@@ -216,6 +218,7 @@ def parse_results(results_dir: Path, ligand_id: str, job_id: str) -> Dict[str, A
         result['confidence_data'] = confidence_data
     except Exception as e:
         print(f'Error parsing confidence data: {e}')
+        result['confidence_data'] = None
     
     # try:
     #     pre_affinity_file = str(list(predictions_dir.glob("pre_affinity*.npz"))[0])
