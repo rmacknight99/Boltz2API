@@ -25,6 +25,13 @@ TEMP_DIR = Path("./temp")
 RESULTS_DIR.mkdir(exist_ok=True)
 TEMP_DIR.mkdir(exist_ok=True)
 
+# GPU Configuration - set the number of available GPUs
+NUM_GPUS = int(os.environ.get("NUM_GPUS", "4"))
+#AVAILABLE_GPUS = list(range(NUM_GPUS))
+AVAILABLE_GPUS=[2, 0, 3, 1] #did work
+#AVAILABLE_GPUS=[3, 0, 2, 1] #did not work
+#AVAILABLE_GPUS=[0, 2, 1, 3] #did no work
+
 # Store job results in memory (in production, use Redis or database)
 job_results = {}
 
@@ -65,7 +72,7 @@ def create_config_file(protein_sequence: str, ligand_smiles: str, ligand_id: str
     
     return config_file
 
-def run_boltz_prediction(config_path: Path, job_id: str, options: Dict[str, Any] = None) -> tuple[bool, str, Dict[str, Any]]:
+def run_boltz_prediction(config_path: Path, job_id: str, options: Dict[str, Any] = None, device_id: int = 0) -> tuple[bool, str, Dict[str, Any]]:
     """Run Boltz-2 prediction."""
     if options is None:
         options = {}
@@ -84,8 +91,8 @@ def run_boltz_prediction(config_path: Path, job_id: str, options: Dict[str, Any]
         "--out_dir", str(output_dir),
         "--no_kernels",
         # Use this to avoid CUDA compilation issues
-        "--devices", "3",  
-        # Use 1 device (can be adjusted based on your GPU setup)
+        "--devices", str(device_id),  
+        # Use specified device
         "--accelerator", "gpu",
         "--output_format", options.get("output_format", "mmcif"), 
         # mmcif is more detailed than pdb
@@ -99,7 +106,7 @@ def run_boltz_prediction(config_path: Path, job_id: str, options: Dict[str, Any]
         # Default, good balance
         "--max_parallel_samples", "1",
         # Conservative to avoid GPU memory issues
-        "--num_workers", "2",
+        "--num_workers", "16",
         # Default, adjust based on CPU cores
         "--affinity_mw_correction",
         # Enable molecular weight correction for affinity
@@ -126,13 +133,13 @@ def run_boltz_prediction(config_path: Path, job_id: str, options: Dict[str, Any]
     except Exception as e:
         return False, f"Error: {str(e)}", {}
 
-def run_single_ligand_prediction(config_file: Path, job_id: str, ligand_id: str, options: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+def run_single_ligand_prediction(config_file: Path, job_id: str, ligand_id: str, options: Dict[str, Any], device_id: int = 0) -> Tuple[bool, str, Dict[str, Any]]:
     """Run Boltz-2 prediction for a single ligand in parallel processing."""
     
     output_dir = RESULTS_DIR / job_id / ligand_id
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f'Running Boltz-2 prediction for ligand {ligand_id}, results will be saved in {output_dir}')
+    print(f'Running Boltz-2 prediction for ligand {ligand_id} on GPU {device_id}, results will be saved in {output_dir}')
     
     # Set up environment
     env = os.environ.copy()
@@ -144,7 +151,7 @@ def run_single_ligand_prediction(config_file: Path, job_id: str, ligand_id: str,
         "--use_msa_server",
         "--out_dir", str(output_dir),
         "--no_kernels",
-        "--devices", "4",
+        "--devices", str(device_id),
         "--accelerator", "gpu",
         "--output_format", options.get("output_format", "mmcif"),
         "--diffusion_samples", str(options.get("diffusion_samples", 1)),
@@ -254,7 +261,14 @@ def parse_results(results_dir: Path, ligand_id: str, job_id: str) -> Dict[str, A
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint."""
-    return jsonify({"status": "healthy", "timestamp": time.time()})
+    return jsonify({
+        "status": "healthy", 
+        "timestamp": time.time(),
+        "gpu_config": {
+            "num_gpus": NUM_GPUS,
+            "available_gpus": AVAILABLE_GPUS
+        }
+    })
 
 @app.route('/predict', methods=['POST'])
 def predict():
@@ -282,8 +296,8 @@ def predict():
         "output_format": data.get("output_format", "mmcif")
     }
     
-    # Run prediction
-    success, message, results = run_boltz_prediction(config_file, job_id, options)
+    # Run prediction on first available GPU
+    success, message, results = run_boltz_prediction(config_file, job_id, options, AVAILABLE_GPUS[0])
     
     # Store results
     job_results[job_id] = {
@@ -353,14 +367,23 @@ def predict_multi():
         config_files.append(config_file)
         ligand_ids.append(ligand_id)
     
-    # Run predictions in parallel
+    # Run predictions in parallel across available GPUs
     start_time = time.time()
     
+    # Create GPU assignments for ligands
+    gpu_assignments = {}
+    for i, ligand_id in enumerate(ligand_ids):
+        gpu_id = AVAILABLE_GPUS[i % NUM_GPUS]
+        gpu_assignments[ligand_id] = gpu_id
+    
+    print(f'Processing {len(ligands)} ligands across {NUM_GPUS} GPUs')
+    print(f'GPU assignments: {gpu_assignments}')
+    
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(config_files))) as executor:
-            # Submit all jobs
+        with concurrent.futures.ThreadPoolExecutor(max_workers=NUM_GPUS) as executor:
+            # Submit all jobs with their assigned GPU
             future_to_ligand = {
-                executor.submit(run_single_ligand_prediction, config_file, job_id, ligand_id, options): ligand_id
+                executor.submit(run_single_ligand_prediction, config_file, job_id, ligand_id, options, gpu_assignments[ligand_id]): ligand_id
                 for config_file, ligand_id in zip(config_files, ligand_ids)
             }
             
@@ -460,4 +483,6 @@ def cleanup_job(job_id):
     return jsonify({"message": f"Job {job_id} cleaned up successfully"})
 
 if __name__ == '__main__':
+    print(f"Starting Boltz-2 API with {NUM_GPUS} GPU(s): {AVAILABLE_GPUS}")
+    print(f"Set NUM_GPUS environment variable to configure GPU count (default: 1)")
     app.run(host='0.0.0.0', port=5000, debug=True) 
