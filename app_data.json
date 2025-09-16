@@ -1,0 +1,52 @@
+{
+    "orchard_config": {
+        "paths": {
+            "amides_file": "./amides.txt",
+            "pdb_to_length_file": "./data_files/pdb_to_length.json",
+            "pdb_files_pattern": "/project/flame/rmacknig/pdb_files_by_chembl_id/*/*_clean.pdb",
+            "results_base_dir": "/project/flame/rmacknig/boltz2_configs",
+            "predictions_base_dir": "/project/flame/rmacknig",
+            "base_predictions_file": "/project/flame/rmacknig/predictions.json"
+        },
+        "settings": {
+            "max_protein_length": 1000,
+            "default_num_workers": 2,
+            "cleanup_frequency": 20,
+            "save_frequency": 5,
+            "timeout_per_ligand": 1800,
+            "cuda_visible_devices_env": true
+        },
+        "slurm_config": {
+            "use_slurm": true,
+            "partition": "preempt",
+            "time_limit": "12:00:00",
+            "mem_per_gpu": "100G",
+            "cpus_per_gpu": 8,
+            "conda_env": "boltz2",
+            "conda_path": "~/miniconda3/etc/profile.d/conda.sh",
+            "job_name_prefix": "boltz2_api",
+            "scripts_dir": "./slurm_scripts",
+            "max_concurrent_jobs": 10
+        },
+        "cluster_config": {
+            "use_remote_cluster": true,
+            "ssh_host": "your-cluster-hostname.edu",
+            "ssh_user": "your-username",
+            "ssh_key_path": "~/.ssh/id_rsa",
+            "ssh_port": 22,
+            "remote_work_dir": "/home/your-username/boltz2_api_remote",
+            "remote_conda_path": "~/miniconda3/etc/profile.d/conda.sh",
+            "remote_conda_env": "boltz2",
+            "file_transfer_method": "scp",
+            "connection_timeout": 30
+        },
+        "boltz_defaults": {
+            "diffusion_samples": 1,
+            "recycling_steps": 3,
+            "sampling_steps": 200,
+            "output_format": "mmcif",
+            "diffusion_samples_affinity": "5",
+            "max_parallel_samples": "1"
+        }
+    }
+}
