@@ -13,14 +13,25 @@ import concurrent.futures
 import glob
 import shutil
 import re
+import logging
+import warnings
+import threading
 from pathlib import Path
 from typing import Dict, List, Any, Tuple, Optional
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import numpy as np
 from Bio.PDB import PDBParser, PPBuilder
+
+# Aggressively suppress Paramiko logging and warnings
+logging.getLogger("paramiko").setLevel(logging.CRITICAL)
+logging.getLogger("paramiko.transport").setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore", category=ResourceWarning, module="paramiko")
+
 try:
     import paramiko
+    # Disable paramiko's default logging to stderr
+    paramiko.util.log_to_file(os.devnull)
     SSH_AVAILABLE = True
 except ImportError:
     SSH_AVAILABLE = False
@@ -28,6 +39,150 @@ except ImportError:
 
 app = Flask(__name__)
 CORS(app)
+
+# SSH Connection Pool
+import threading
+import queue
+
+class SSHConnectionPool:
+    """Thread-safe SSH connection pool to avoid overwhelming IAP tunnel."""
+    
+    def __init__(self, host_alias, pool_size=5, max_age=300):
+        self.host_alias = host_alias
+        self.pool_size = pool_size
+        self.max_age = max_age  # 5 minutes
+        self.pool = queue.Queue(maxsize=pool_size)
+        self.lock = threading.Lock()
+        self.creation_lock = threading.Lock()  # Serialize connection creation
+        self.connection_times = {}  # client -> timestamp
+        
+    def get_connection(self, timeout=30):
+        """Borrow a connection from the pool. Waits if pool is empty."""
+        from ssh_config_handler import create_ssh_client_with_config
+        
+        # First try non-blocking to see if there's a valid cached connection
+        try:
+            client = self.pool.get_nowait()
+            
+            # Check if connection is still valid and not too old
+            with self.lock:
+                created_at = self.connection_times.get(id(client), 0)
+                age = time.time() - created_at
+                
+            if age < self.max_age:
+                try:
+                    transport = client.get_transport()
+                    if transport and transport.is_active():
+                        return client
+                except:
+                    pass
+            
+            # Connection is stale, close it and create new one
+            try:
+                client.close()
+            except:
+                pass
+            with self.lock:
+                self.connection_times.pop(id(client), None)
+                
+        except queue.Empty:
+            # Pool is empty, check if we're under capacity
+            with self.lock:
+                current_count = len(self.connection_times)
+            
+            # If under capacity, create new connection (serialized)
+            if current_count < self.pool_size:
+                with self.creation_lock:
+                    # Double-check count after acquiring lock
+                    with self.lock:
+                        current_count = len(self.connection_times)
+                    if current_count < self.pool_size:
+                        client = create_ssh_client_with_config(self.host_alias, banner_timeout=30)
+                        with self.lock:
+                            self.connection_times[id(client)] = time.time()
+                        return client
+                    # Someone else created while we waited, try getting from pool
+                    try:
+                        client = self.pool.get_nowait()
+                        return client
+                    except queue.Empty:
+                        pass
+            
+            # At capacity - wait for a connection to be returned
+            try:
+                client = self.pool.get(timeout=timeout)
+                # Validate returned connection
+                try:
+                    transport = client.get_transport()
+                    if transport and transport.is_active():
+                        return client
+                except:
+                    pass
+                # Connection invalid, close and create new (serialized)
+                try:
+                    client.close()
+                except:
+                    pass
+                with self.lock:
+                    self.connection_times.pop(id(client), None)
+            except queue.Empty:
+                # Timeout waiting - return error
+                raise TimeoutError(f"Timeout waiting for SSH connection after {timeout}s")
+        
+        # Create new connection (only reached if stale connection was removed) - serialized
+        with self.creation_lock:
+            client = create_ssh_client_with_config(self.host_alias, banner_timeout=30)
+            with self.lock:
+                self.connection_times[id(client)] = time.time()
+            return client
+    
+    def return_connection(self, client):
+        """Return a connection to the pool."""
+        if not client:
+            return
+            
+        try:
+            # Check if connection is still valid
+            transport = client.get_transport()
+            if transport and transport.is_active():
+                # Try to return to pool (non-blocking)
+                try:
+                    self.pool.put_nowait(client)
+                    return
+                except queue.Full:
+                    # Pool is full, close this connection
+                    pass
+        except:
+            pass
+        
+        # Connection is invalid or pool is full, close it
+        try:
+            client.close()
+        except:
+            pass
+        with self.lock:
+            self.connection_times.pop(id(client), None)
+    
+    def close_all(self):
+        """Close all connections in the pool."""
+        while not self.pool.empty():
+            try:
+                client = self.pool.get_nowait()
+                client.close()
+            except:
+                pass
+        with self.lock:
+            self.connection_times.clear()
+
+# Global connection pool (initialized after config is loaded)
+ssh_connection_pool = None
+
+# Register database query blueprint
+try:
+    from database_query_endpoints import db_query_bp
+    app.register_blueprint(db_query_bp)
+except ImportError:
+    print("Warning: Could not import database query endpoints")
 
 # Configuration
 RESULTS_DIR = Path("./results")
@@ -80,46 +235,73 @@ class SSHClusterConnection:
             return False
             
         try:
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            # Import our SSH config handler
+            from ssh_config_handler import create_ssh_client_with_config
             
             # Connection parameters
             hostname = CLUSTER_CONFIG.get("ssh_host")
             username = CLUSTER_CONFIG.get("ssh_user")
             key_path = os.path.expanduser(CLUSTER_CONFIG.get("ssh_key_path", "~/.ssh/id_rsa"))
             port = CLUSTER_CONFIG.get("ssh_port", 22)
-            timeout = CLUSTER_CONFIG.get("connection_timeout", 30)
             
-            if not hostname or not username:
-                print("Error: ssh_host and ssh_user must be configured")
+            if not hostname:
+                print("Error: ssh_host must be configured")
                 return False
             
-            # Try key-based authentication first
+            # Try to connect using SSH config (which handles ProxyCommand)
             try:
-                self.client.connect(
+                self.client = create_ssh_client_with_config(
                     hostname=hostname,
                     username=username,
                     key_filename=key_path,
-                    port=port,
-                    timeout=timeout
+                    port=port
                 )
-                print(f"✅ Connected to {hostname} via SSH key")
-            except Exception as key_error:
-                print(f"Key auth failed: {key_error}")
-                # Fallback to password (will prompt)
+                print(f"✅ Connected to {hostname} via SSH config")
+            except Exception as config_error:
+                print(f"SSH config connection failed: {config_error}")
+                
+                # Fallback to direct connection if SSH config fails
+                self.client = paramiko.SSHClient()
+                self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                
+                # Try key-based authentication
                 try:
-                    import getpass
-                    password = getpass.getpass(f"Password for {username}@{hostname}: ")
                     self.client.connect(
                         hostname=hostname,
                         username=username,
-                        password=password,
+                        key_filename=key_path,
                         port=port,
-                        timeout=timeout
+                        timeout=30
                     )
-                    print(f"✅ Connected to {hostname} via password")
-                except Exception as pass_error:
-                    print(f"Password auth failed: {pass_error}")
+                    print(f"✅ Connected to {hostname} via direct connection")
+                except paramiko.ssh_exception.SSHException as ssh_error:
+                    error_msg = str(ssh_error)
+                    # Check if this is a host key verification failure
+                    if "Host key for server" in error_msg and "does not match" in error_msg:
+                        print(f"⚠️  Host key verification failed, attempting to fix...")
+                        from ssh_config_handler import remove_known_host_entry
+                        if remove_known_host_entry(hostname):
+                            # Retry after removing conflicting host key
+                            try:
+                                self.client.connect(
+                                    hostname=hostname,
+                                    username=username,
+                                    key_filename=key_path,
+                                    port=port,
+                                    timeout=30
+                                )
+                                print(f"✅ Connected to {hostname} after fixing host key")
+                            except Exception as retry_error:
+                                print(f"Connection failed after host key fix: {retry_error}")
+                                return False
+                        else:
+                            print(f"Direct connection failed: {ssh_error}")
+                            return False
+                    else:
+                        print(f"Direct connection failed: {ssh_error}")
+                        return False
+                except Exception as direct_error:
+                    print(f"Direct connection failed: {direct_error}")
                     return False
             
             # Set up SFTP
@@ -141,10 +323,27 @@ class SSHClusterConnection:
     
     def disconnect(self):
         """Close SSH connection."""
-        if self.sftp:
-            self.sftp.close()
-        if self.client:
-            self.client.close()
+        try:
+            if self.sftp:
+                self.sftp.close()
+                self.sftp = None
+        except:
+            pass
+        
+        try:
+            if self.client:
+                # Get the transport to close any proxy processes
+                transport = self.client.get_transport()
+                if transport:
+                    # Close the underlying socket/proxy
+                    sock = transport.sock
+                    if sock:
+                        sock.close()
+                    transport.close()
+                self.client.close()
+                self.client = None
+        except:
+            pass
     
     def execute_command(self, command: str, timeout: int = 60) -> Tuple[int, str, str]:
         """Execute a command on the remote cluster."""
@@ -158,6 +357,19 @@ class SSHClusterConnection:
             stderr_text = stderr.read().decode('utf-8')
             return exit_code, stdout_text, stderr_text
         except Exception as e:
+            # If connection is broken, try to reconnect once
+            if "SSH session not active" in str(e) or "Broken pipe" in str(e):
+                print(f"SSH connection lost, attempting to reconnect...")
+                self.disconnect()
+                if self.connect():
+                    print("✅ Reconnected successfully, retrying command...")
+                    stdin, stdout, stderr = self.client.exec_command(command, timeout=timeout)
+                    exit_code = stdout.channel.recv_exit_status()
+                    stdout_text = stdout.read().decode('utf-8')
+                    stderr_text = stderr.read().decode('utf-8')
+                    return exit_code, stdout_text, stderr_text
+                else:
+                    raise Exception(f"Failed to reconnect: {e}")
             raise Exception(f"Command execution failed: {e}")
     
     def upload_file(self, local_path: str, remote_path: str) -> bool:
@@ -210,6 +422,57 @@ class SSHClusterConnection:
 
 # Global SSH connection instance
 ssh_cluster = SSHClusterConnection()
+
+# Semaphore to limit concurrent SSH connections (prevent overwhelming gcloud IAP tunnels)
+# Allow max 5 simultaneous connections
+_ssh_semaphore = threading.Semaphore(5)
+
+def execute_remote_command_with_cleanup(command: str, timeout: int = 60) -> Tuple[int, str, str]:
+    """
+    Execute a command on the remote cluster with automatic connection cleanup.
+    This is safer than using the global ssh_cluster for ProxyCommand connections
+    to avoid file descriptor leaks.
+    Rate-limited to prevent overwhelming the SSH proxy.
+    """
+    from ssh_config_handler import create_ssh_client_with_config
+    
+    ssh_host_alias = os.getenv('BOLTZ_2_SSH_HOST_ALIAS')
+    if not ssh_host_alias:
+        ssh_host_alias = CLUSTER_CONFIG.get("ssh_host")
+    
+    if not ssh_host_alias:
+        raise Exception("SSH host not configured")
+    
+    # Use semaphore to limit concurrent connections
+    with _ssh_semaphore:
+        client = None
+        try:
+            # Create a fresh connection
+            client = create_ssh_client_with_config(ssh_host_alias)
+            
+            # Execute the command
+            stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+            exit_code = stdout.channel.recv_exit_status()
+            stdout_text = stdout.read().decode('utf-8')
+            stderr_text = stderr.read().decode('utf-8')
+            
+            return exit_code, stdout_text, stderr_text
+            
+        except Exception as e:
+            raise Exception(f"Command execution failed: {e}")
+        finally:
+            # Always clean up the connection
+            if client:
+                try:
+                    transport = client.get_transport()
+                    if transport:
+                        sock = transport.sock
+                        if sock:
+                            sock.close()
+                        transport.close()
+                    client.close()
+                except:
+                    pass
 
 def get_full_sequence(seq_dict):
     """Get full sequence from sequence dictionary."""
@@ -483,13 +746,10 @@ def get_slurm_job_status(slurm_job_id: str) -> Dict[str, Any]:
     """Get the status of a SLURM job."""
     try:
         if CLUSTER_CONFIG.get("use_remote_cluster", False):
-            # SSH-based status check
-            if not ssh_cluster.client:
-                if not ssh_cluster.connect():
-                    return {"status": "CONNECTION_ERROR", "reason": "Could not connect to cluster", "found": False}
-            
-            exit_code, stdout, stderr = ssh_cluster.execute_command(
-                f"squeue -j {slurm_job_id} --format=%T,%R --noheader"
+            # SSH-based status check with automatic cleanup
+            exit_code, stdout, stderr = execute_remote_command_with_cleanup(
+                f"squeue -j {slurm_job_id} --format=%T,%R --noheader",
+                timeout=30
             )
             
             if exit_code == 0 and stdout.strip():
@@ -529,22 +789,22 @@ def check_completed_slurm_job(slurm_job_id: str) -> Dict[str, Any]:
     """Check if a SLURM job has completed by looking at sacct."""
     try:
         if CLUSTER_CONFIG.get("use_remote_cluster", False):
-            # SSH-based sacct check
-            if ssh_cluster.client:
-                exit_code, stdout, stderr = ssh_cluster.execute_command(
-                    f"sacct -j {slurm_job_id} --format=State --noheader --parsable2"
-                )
-                
-                if exit_code == 0 and stdout.strip():
-                    states = [line.strip() for line in stdout.strip().split('\n') if line.strip()]
-                    if states:
-                        # Get the last state (most recent)
-                        final_state = states[-1]
-                        return {
-                            "status": final_state,
-                            "reason": "Job completed",
-                            "found": True
-                        }
+            # SSH-based sacct check with automatic cleanup
+            exit_code, stdout, stderr = execute_remote_command_with_cleanup(
+                f"sacct -j {slurm_job_id} --format=State --noheader --parsable2",
+                timeout=30
+            )
+            
+            if exit_code == 0 and stdout.strip():
+                states = [line.strip() for line in stdout.strip().split('\n') if line.strip()]
+                if states:
+                    # Get the last state (most recent)
+                    final_state = states[-1]
+                    return {
+                        "status": final_state,
+                        "reason": "Job completed",
+                        "found": True
+                    }
         else:
             # Local sacct check
             result = subprocess.run(
@@ -571,7 +831,9 @@ def check_completed_slurm_job(slurm_job_id: str) -> Dict[str, Any]:
 def get_slurm_log_files(job_id: str, slurm_job_id: str) -> Tuple[Optional[Path], Optional[Path]]:
     """Find SLURM output and error log files for a job."""
     if CLUSTER_CONFIG.get("use_remote_cluster", False):
-        # SSH-based log file access
+        # SSH-based log file access with automatic cleanup
+        from ssh_config_handler import create_ssh_client_with_config
+        
         remote_work_dir = CLUSTER_CONFIG.get("remote_work_dir", "/tmp/boltz2_api_remote")
         remote_scripts_dir = f"{remote_work_dir}/slurm_scripts"
         
@@ -592,16 +854,57 @@ def get_slurm_log_files(job_id: str, slurm_job_id: str) -> Tuple[Optional[Path],
         out_file = None
         err_file = None
         
-        if ssh_cluster.client:
+        # Create temporary SSH connection for file operations
+        ssh_host_alias = os.getenv('BOLTZ_2_SSH_HOST_ALIAS', CLUSTER_CONFIG.get("ssh_host"))
+        if not ssh_host_alias:
+            return (None, None)
+        
+        client = None
+        sftp = None
+        try:
+            client = create_ssh_client_with_config(ssh_host_alias)
+            sftp = client.open_sftp()
+            
             # Check and download output log
-            if ssh_cluster.file_exists(remote_out_file):
-                if ssh_cluster.download_file(remote_out_file, str(local_out_file)):
-                    out_file = local_out_file
+            try:
+                sftp.stat(remote_out_file)
+                sftp.get(remote_out_file, str(local_out_file))
+                out_file = local_out_file
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"Error downloading output log: {e}")
             
             # Check and download error log
-            if ssh_cluster.file_exists(remote_err_file):
-                if ssh_cluster.download_file(remote_err_file, str(local_err_file)):
-                    err_file = local_err_file
+            try:
+                sftp.stat(remote_err_file)
+                sftp.get(remote_err_file, str(local_err_file))
+                err_file = local_err_file
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                print(f"Error downloading error log: {e}")
+                
+        except Exception as e:
+            print(f"SSH connection failed for log files: {e}")
+        finally:
+            # Clean up connections
+            if sftp:
+                try:
+                    sftp.close()
+                except:
+                    pass
+            if client:
+                try:
+                    transport = client.get_transport()
+                    if transport:
+                        sock = transport.sock
+                        if sock:
+                            sock.close()
+                        transport.close()
+                    client.close()
+                except:
+                    pass
         
         return (out_file, err_file)
     else:
@@ -1228,15 +1531,490 @@ def predict_multi():
         for config_file in config_files:
             config_file.unlink(missing_ok=True)
 
-@app.route('/predict_orchard', methods=['POST'])
-def predict_orchard():
-    """Submit orchard cluster predictions with GPU count, specific amides, and ChEMBL ID filtering."""
-    slurm_config = ORCHARD_CONFIG.get("slurm_config", {})
+@app.route('/predict_cluster', methods=['POST'])
+def predict_cluster():
+    """Create SLURM submission scripts for molecule predictions on the orchard cluster.
     
-    if slurm_config.get("use_slurm", False):
-        return predict_orchard_slurm()
+    Optional: Set 'submit_jobs': true to submit the scripts immediately and monitor their progress.
+    Accepts both molecule_* and amide_* parameters for backward compatibility.
+    Uses protein_ids to specify target proteins (ChEMBL IDs like 'CHEMBL1234' or uploaded PDB IDs).
+    """
+    from ssh_config_handler import create_ssh_client_with_config
+    from slurm_job_monitor import SlurmJobMonitor
+    
+    data = request.json
+    
+    # Validate required parameters
+    if not data:
+        return jsonify({"error": "Request body is required"}), 400
+    
+    # Get molecule SMILES - support both old and new parameter names
+    molecule_smiles = data.get("molecule_smiles") or data.get("amide_smiles")
+    if not molecule_smiles:
+        return jsonify({"error": "molecule_smiles (or amide_smiles) is required"}), 400
+    
+    # Get molecule names - support both old and new parameter names
+    molecule_names = data.get("molecule_names") or data.get("amide_names")
+    if not molecule_names:
+        return jsonify({"error": "molecule_names (or amide_names) is required"}), 400
+    
+    # Get Protein IDs - should be a list (can be ChEMBL IDs or uploaded PDB IDs)
+    protein_ids = data.get("protein_ids") or data.get("chembl_ids", [])  # Support both new and old parameter names    
+    
+    # Check if we should submit jobs
+    submit_jobs = data.get("submit_jobs", False)
+    
+    # Normalize to lists
+    if isinstance(molecule_smiles, str):
+        molecules_to_process = [molecule_smiles]
+    elif isinstance(molecule_smiles, list):
+        molecules_to_process = molecule_smiles
     else:
-        return predict_orchard_direct()
+        return jsonify({"error": "molecule_smiles must be a string or list of strings"}), 400
+    
+    if isinstance(molecule_names, str):
+        names_to_process = [molecule_names]
+    elif isinstance(molecule_names, list):
+        names_to_process = molecule_names
+    else:
+        return jsonify({"error": "molecule_names must be a string or list of strings"}), 400
+    
+    if isinstance(protein_ids, str):
+        protein_ids = [protein_ids]
+    elif not isinstance(protein_ids, list):
+        protein_ids = []
+    
+    # Validate lengths - only check that molecule SMILES and names match
+    if len(molecules_to_process) != len(names_to_process):
+        return jsonify({"error": f"molecule_smiles and molecule_names must have the same length. Got {len(molecules_to_process)} SMILES and {len(names_to_process)} names"}), 400
+    
+    # Protein IDs can be any number - they represent targets to test against, not a 1:1 mapping with molecules
+    
+    # SLURM configuration
+    slurm_config = ORCHARD_CONFIG.get("slurm_config", {})
+    partition = slurm_config.get("partition", "preempt")
+    time_limit = slurm_config.get("time_limit", "12:00:00")
+    mem_per_gpu = slurm_config.get("mem_per_gpu", "100G")
+    cpus_per_gpu = slurm_config.get("cpus_per_gpu", 8)
+    conda_env = slurm_config.get("conda_env", "boltz2")
+    conda_path = slurm_config.get("conda_path", "/project/flame/rmacknig/miniconda3/etc/profile.d/conda.sh")
+    
+    # Remote directory structure - require environment variables for security
+    cluster_config = ORCHARD_CONFIG.get("cluster_config", {})
+    remote_work_dir = os.getenv('BOLTZ_2_REMOTE_WORK_DIR')
+    if not remote_work_dir:
+        # Try to get from config file, but don't provide a default
+        remote_work_dir = cluster_config.get("remote_work_dir")
+        if not remote_work_dir:
+            return jsonify({
+                "error": "BOLTZ_2_REMOTE_WORK_DIR environment variable is required",
+                "message": "Set BOLTZ_2_REMOTE_WORK_DIR to the remote cluster working directory"
+            }), 400
+    
+    remote_base_dir = os.getenv('BOLTZ_2_REMOTE_BASE_DIR', f"{remote_work_dir}/boltz2_api_remote")
+    
+    try:
+        # Connect to the cluster via SSH
+        ssh_host_alias = os.getenv('BOLTZ_2_SSH_HOST_ALIAS')
+        if not ssh_host_alias:
+            return jsonify({
+                "error": "BOLTZ_2_SSH_HOST_ALIAS environment variable is required",
+                "message": "Set BOLTZ_2_SSH_HOST_ALIAS to your SSH config host alias"
+            }), 400
+        
+        print(f"🔌 Connecting to cluster via SSH host alias: {ssh_host_alias}...")
+        ssh_client = create_ssh_client_with_config(ssh_host_alias)
+        sftp = ssh_client.open_sftp()
+        
+        created_scripts = []
+        
+        # Generate timestamp once for all files
+        timestamp = int(time.time())
+        
+        # Debug: Print Protein IDs received
+        print(f"📋 Protein IDs received: {protein_ids}")
+        
+        # If Protein IDs provided, write them to a file
+        protein_ids_file_path = None
+        if protein_ids and len(protein_ids) > 0:
+            # Create a unique filename for Protein IDs
+            protein_ids_filename = f"protein_ids_custom_{timestamp}.txt"
+            protein_ids_dir = f"{remote_work_dir}/protein_id_files"
+            protein_ids_file_path = f"{protein_ids_dir}/{protein_ids_filename}"
+            
+            try:
+                # Ensure protein_id_files directory exists
+                try:
+                    sftp.stat(protein_ids_dir)
+                except FileNotFoundError:
+                    print(f"Creating protein_id_files directory...")
+                    sftp.mkdir(protein_ids_dir)
+                
+                # Write Protein IDs to file
+                with sftp.open(protein_ids_file_path, 'w') as f:
+                    for protein_id in protein_ids:
+                        f.write(f"{protein_id}\n")
+                
+                # Verify file was created
+                file_info = sftp.stat(protein_ids_file_path)
+                print(f"✅ Created Protein IDs file: {protein_ids_filename} (size: {file_info.st_size} bytes)")
+                print(f"   Contains {len(protein_ids)} Protein IDs")
+                print(f"   Path: {protein_ids_file_path}")
+            except Exception as e:
+                print(f"❌ Failed to create Protein IDs file: {e}")
+                import traceback
+                traceback.print_exc()
+                protein_ids_file_path = None
+        else:
+            print(f"📋 No Protein IDs provided, using default file")
+        
+        # Default to all ChEMBL IDs if none provided or if file creation failed
+        if not protein_ids_file_path:
+            protein_ids_file_path = f"{remote_work_dir}/protein_id_files/chembl_ids_all.txt"
+            print(f"📋 Using default Protein IDs file: {protein_ids_file_path}")
+        
+        # Create a submission script for each molecule
+        for idx, (smiles, name) in enumerate(zip(molecules_to_process, names_to_process)):
+            # Create script filename based on molecule name (sanitized)
+            safe_name = "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in name)
+            script_name = f"boltz_{safe_name}_{timestamp}_{idx}.sh"
+            
+            # Create the SLURM script content
+            script_content = f"""#!/bin/bash
+#SBATCH --time={time_limit}
+#SBATCH --gpus=1
+#SBATCH --mem-per-gpu={mem_per_gpu}
+#SBATCH --cpus-per-gpu={cpus_per_gpu}
+#SBATCH --partition={partition}
+#SBATCH --job-name=boltz2_{safe_name}
+#SBATCH --output={remote_base_dir}/logs/{safe_name}_{timestamp}_%j.out
+#SBATCH --error={remote_base_dir}/logs/{safe_name}_{timestamp}_%j.err
+
+echo "Starting job at $(date)"
+echo "Running on node: $(hostname)"
+echo "Molecule: {name}"
+echo "SMILES: {smiles}"
+echo "Using Protein IDs file: {protein_ids_file_path}"
+
+# Activate conda environment
+source {conda_path}
+conda activate {conda_env}
+
+# Change to working directory
+cd {remote_work_dir}
+
+# Run the prediction
+python ./boltz_predict.py 1 \\
+    --molecule-smiles '{smiles}' \\
+    --molecule-name '{name}' \\
+    --protein-file '{protein_ids_file_path}'
+
+echo "Job finished at $(date)"
+"""
+            
+            # Write script to remote directory
+            remote_script_path = f"{remote_base_dir}/scripts/{script_name}"
+            
+            try:
+                # Create a temporary file and upload it
+                with sftp.open(remote_script_path, 'w') as f:
+                    f.write(script_content)
+                
+                # Make the script executable
+                sftp.chmod(remote_script_path, 0o755)
+                
+                created_scripts.append({
+                    "amide_name": name,
+                    "amide_smiles": smiles,
+                    "protein_id": protein_ids[idx] if idx < len(protein_ids) else None,
+                    "script_name": script_name,
+                    "script_path": remote_script_path,
+                    "output_file_pattern": f"{remote_base_dir}/logs/{safe_name}_{timestamp}_%j.out",
+                    "error_file_pattern": f"{remote_base_dir}/logs/{safe_name}_{timestamp}_%j.err",
+                    "index": idx + 1
+                })
+                
+                print(f"✅ Created submission script: {script_name}")
+                
+            except Exception as e:
+                print(f"❌ Failed to create script for {name}: {e}")
+                created_scripts.append({
+                    "amide_name": name,
+                    "amide_smiles": smiles,
+                    "protein_id": protein_ids[idx] if idx < len(protein_ids) else None,
+                    "error": str(e)
+                })
+        
+        # Submit jobs if requested
+        submitted_jobs = []
+        job_monitor = None
+        
+        if submit_jobs:
+            print("\n🚀 Submitting SLURM jobs...")
+            job_monitor = SlurmJobMonitor(ssh_client, remote_base_dir, ssh_host_alias)
+            
+            for script_info in created_scripts:
+                if 'script_path' in script_info:
+                    # Prepare job info with actual file paths for monitoring
+                    slurm_job_id = job_monitor.submit_job(script_info['script_path'], script_info)
+                    
+                    if slurm_job_id:
+                        # Set actual output/error file paths with job ID
+                        script_info['output_file'] = script_info['output_file_pattern'].replace('%j', slurm_job_id)
+                        script_info['error_file'] = script_info['error_file_pattern'].replace('%j', slurm_job_id)
+                        script_info['slurm_job_id'] = slurm_job_id
+                        script_info['submitted'] = True
+                        submitted_jobs.append(slurm_job_id)
+                    else:
+                        script_info['submitted'] = False
+                        script_info['submit_error'] = "Failed to submit job"
+        
+        # Store job monitor in global dict if jobs were submitted
+        job_id = generate_job_id()
+        if job_monitor and submitted_jobs:
+            # Store the monitor for later status checks
+            if not hasattr(app, 'job_monitors'):
+                app.job_monitors = {}
+            app.job_monitors[job_id] = job_monitor
+            # Note: The monitor creates fresh SSH connections as needed for status checks
+        
+        # Generate response
+        if submit_jobs:
+            response = jsonify({
+                "job_id": job_id,
+                "status": "jobs_submitted" if submitted_jobs else "submission_failed",
+                "message": f"Submitted {len(submitted_jobs)} jobs for monitoring",
+                "submitted_job_ids": submitted_jobs,
+                "remote_directory": f"{remote_base_dir}/scripts",
+                "scripts": created_scripts,
+                "timestamp": time.time()
+            })
+        else:
+            response = jsonify({
+                "job_id": job_id,
+                "status": "scripts_created",
+                "message": f"Created {len([s for s in created_scripts if 'script_path' in s])} submission scripts",
+                "remote_directory": f"{remote_base_dir}/scripts",
+                "scripts": created_scripts,
+                "timestamp": time.time()
+            })
+        
+        return response
+        
+    except Exception as e:
+        return jsonify({
+            "status": "failed",
+            "error": f"Failed to create submission scripts: {str(e)}",
+            "timestamp": time.time()
+        }), 500
+    finally:
+        # Always clean up SFTP and SSH connections
+        # The job monitor creates fresh connections as needed
+        if 'sftp' in locals() and sftp:
+            try:
+                sftp.close()
+            except:
+                pass
+        
+        if 'ssh_client' in locals() and ssh_client:
+            try:
+                transport = ssh_client.get_transport()
+                if transport:
+                    sock = transport.sock
+                    if sock:
+                        sock.close()
+                    transport.close()
+                ssh_client.close()
+            except:
+                pass
+
+
+@app.route('/orchard_job_status/<job_id>', methods=['GET'])
+def get_orchard_job_status(job_id: str):
+    """Get the status of submitted SLURM jobs."""
+    if not hasattr(app, 'job_monitors'):
+        return jsonify({"error": "No job monitors found"}), 404
+    
+    monitor = app.job_monitors.get(job_id)
+    if not monitor:
+        return jsonify({"error": f"Job monitor not found for job_id: {job_id}"}), 404
+    
+    # Get all job information
+    all_jobs = monitor.get_all_jobs()
+    
+    # Summarize status
+    status_summary = {
+        'pending': 0,
+        'running': 0,
+        'completed': 0,
+        'failed': 0,
+        'other': 0
+    }
+    
+    for slurm_id, job_info in all_jobs.items():
+        status = job_info.get('status', 'UNKNOWN')
+        if status in ['PENDING', 'PD']:
+            status_summary['pending'] += 1
+        elif status in ['RUNNING', 'R']:
+            status_summary['running'] += 1
+        elif status == 'COMPLETED':
+            status_summary['completed'] += 1
+        elif status in ['FAILED', 'CANCELLED', 'TIMEOUT']:
+            status_summary['failed'] += 1
+        else:
+            status_summary['other'] += 1
+    
+    return jsonify({
+        "job_id": job_id,
+        "total_jobs": len(all_jobs),
+        "status_summary": status_summary,
+        "jobs": all_jobs,
+        "timestamp": time.time()
+    })
+
+
+@app.route('/orchard_job_cancel/<job_id>', methods=['POST'])
+def cancel_orchard_jobs(job_id: str):
+    """Cancel all jobs in a submission."""
+    if not hasattr(app, 'job_monitors'):
+        return jsonify({"error": "No job monitors found"}), 404
+    
+    monitor = app.job_monitors.get(job_id)
+    if not monitor:
+        return jsonify({"error": f"Job monitor not found for job_id: {job_id}"}), 404
+    
+    # Get specific job IDs to cancel from request, or cancel all
+    data = request.json or {}
+    slurm_job_ids = data.get('slurm_job_ids', [])
+    
+    if not slurm_job_ids:
+        # Cancel all jobs
+        slurm_job_ids = list(monitor.get_all_jobs().keys())
+    
+    cancelled = []
+    failed = []
+    
+    for slurm_id in slurm_job_ids:
+        if monitor.cancel_job(slurm_id):
+            cancelled.append(slurm_id)
+        else:
+            failed.append(slurm_id)
+    
+    return jsonify({
+        "job_id": job_id,
+        "cancelled": cancelled,
+        "failed_to_cancel": failed,
+        "message": f"Cancelled {len(cancelled)} jobs",
+        "timestamp": time.time()
+    })
+
+
+@app.route('/available_chembl_ids', methods=['GET'])
+def get_available_chembl_ids():
+    """Get available ChEMBL IDs from the target info file on the remote cluster."""
+    target_info_file = "/project/flame/rmacknig/target_info.json"
+    
+    ssh_client = None
+    try:
+        # Connect to cluster to read file
+        ssh_host_alias = os.getenv('BOLTZ_2_SSH_HOST_ALIAS')
+        if not ssh_host_alias:
+            ssh_host_alias = ORCHARD_CONFIG.get("cluster_config", {}).get("ssh_host")
+            if not ssh_host_alias:
+                return jsonify({"error": "BOLTZ_2_SSH_HOST_ALIAS not configured"}), 400
+        
+        from ssh_config_handler import create_ssh_client_with_config
+        ssh_client = create_ssh_client_with_config(ssh_host_alias)
+        
+        # Check if file exists
+        stdin, stdout, stderr = ssh_client.exec_command(f"test -f {target_info_file} && echo 'exists'")
+        if stdout.read().decode().strip() != 'exists':
+            return jsonify({
+                "error": "Target info file not found on remote cluster",
+                "path": target_info_file
+            }), 404
+        
+        # Read the target info from remote
+        stdin, stdout, stderr = ssh_client.exec_command(f"cat {target_info_file}")
+        target_info_json = stdout.read().decode()
+        error = stderr.read().decode()
+        
+        if error:
+            return jsonify({
+                "error": "Error reading target info file",
+                "details": error
+            }), 500
+        
+        # Parse JSON
+        target_info = json.loads(target_info_json)
+        
+        # Extract ChEMBL IDs (keys)
+        chembl_ids = list(target_info.keys())
+        
+        # Get optional parameters
+        include_details = request.args.get('include_details', 'false').lower() == 'true'
+        search_term = request.args.get('search', '')
+        limit = request.args.get('limit', type=int)
+        
+        # Filter by search term if provided
+        if search_term:
+            chembl_ids = [id for id in chembl_ids if search_term.upper() in id.upper()]
+        
+        # Sort ChEMBL IDs
+        chembl_ids.sort()
+        
+        # Apply limit if specified
+        total_count = len(chembl_ids)
+        if limit and limit > 0:
+            chembl_ids = chembl_ids[:limit]
+        
+        # Prepare response
+        response_data = {
+            "total_count": total_count,
+            "returned_count": len(chembl_ids),
+            "chembl_ids": chembl_ids
+        }
+        
+        # Include target details if requested
+        if include_details:
+            details = {}
+            for chembl_id in chembl_ids:
+                details[chembl_id] = target_info.get(chembl_id, {})
+            response_data["target_details"] = details
+        
+        # Add some statistics
+        response_data["statistics"] = {
+            "total_targets": len(target_info),
+            "search_term": search_term if search_term else None,
+            "limited_to": limit if limit else None
+        }
+        
+        return jsonify(response_data)
+        
+    except json.JSONDecodeError as e:
+        return jsonify({
+            "error": "Failed to parse target info file",
+            "message": str(e)
+        }), 500
+    except Exception as e:
+        return jsonify({
+            "error": "Failed to read target info",
+            "message": str(e)
+        }), 500
+    finally:
+        # Clean up SSH connection
+        if ssh_client:
+            try:
+                transport = ssh_client.get_transport()
+                if transport:
+                    sock = transport.sock
+                    if sock:
+                        sock.close()
+                    transport.close()
+                ssh_client.close()
+            except:
+                pass
+
 
 def predict_orchard_slurm():
     """Submit orchard predictions via SLURM job submission."""
@@ -1598,10 +2376,53 @@ def predict_orchard_direct():
 @app.route('/results/<job_id>', methods=['GET'])
 def get_results(job_id):
     """Get results for a specific job."""
-    if job_id not in job_results:
+    # Check if it's a regular job
+    if job_id in job_results:
+        job_info = job_results[job_id]
+    # Check if it's an orchard monitored job
+    elif hasattr(app, 'job_monitors') and job_id in app.job_monitors:
+        # For orchard jobs, return monitoring status instead
+        # Results should be retrieved via database query endpoints after completion
+        monitor = app.job_monitors[job_id]
+        all_jobs = monitor.get_all_jobs()
+        
+        # Count job statuses
+        status_counts = {'completed': 0, 'running': 0, 'pending': 0, 'failed': 0}
+        for slurm_id, job_data in all_jobs.items():
+            status = job_data.get('status', 'UNKNOWN')
+            if status == 'COMPLETED':
+                status_counts['completed'] += 1
+            elif status in ['RUNNING', 'R']:
+                status_counts['running'] += 1
+            elif status in ['PENDING', 'PD']:
+                status_counts['pending'] += 1
+            else:
+                status_counts['failed'] += 1
+        
+        # Determine overall status
+        if status_counts['running'] > 0 or status_counts['pending'] > 0:
+            overall_status = "processing"
+        elif status_counts['completed'] == len(all_jobs):
+            overall_status = "completed"
+        else:
+            overall_status = "partially_completed"
+        
+        return jsonify({
+            "job_id": job_id,
+            "type": "orchard_batch",
+            "status": overall_status,
+            "summary": {
+                "total_jobs": len(all_jobs),
+                "completed": status_counts['completed'],
+                "running": status_counts['running'],
+                "pending": status_counts['pending'],
+                "failed": status_counts['failed']
+            },
+            "message": "This is an orchard batch job. Use database query endpoints to retrieve results after completion.",
+            "slurm_jobs": all_jobs
+        })
+    else:
         return jsonify({"error": "Job not found"}), 404
-    
-    job_info = job_results[job_id]
     
     # If this is a SLURM job, update its status
     if "slurm_job_id" in job_info:
@@ -1625,13 +2446,54 @@ def get_results(job_id):
 @app.route('/job_status/<job_id>', methods=['GET'])
 def get_job_status(job_id):
     """Get enhanced status of a specific job with log analysis."""
-    if job_id not in job_results:
+    # Check if it's a regular job
+    if job_id in job_results:
+        # Get number of log lines to return (default 20)
+        num_lines = request.args.get('log_lines', 20, type=int)
+        
+        job_info = job_results[job_id]
+    # Check if it's an orchard monitored job
+    elif hasattr(app, 'job_monitors') and job_id in app.job_monitors:
+        monitor = app.job_monitors[job_id]
+        all_jobs = monitor.get_all_jobs()
+        
+        # Create a summary for orchard jobs
+        status_summary = {
+            'pending': 0,
+            'running': 0,
+            'completed': 0,
+            'failed': 0,
+            'other': 0
+        }
+        
+        for slurm_id, job_data in all_jobs.items():
+            status = job_data.get('status', 'UNKNOWN')
+            if status in ['PENDING', 'PD']:
+                status_summary['pending'] += 1
+            elif status in ['RUNNING', 'R']:
+                status_summary['running'] += 1
+            elif status == 'COMPLETED':
+                status_summary['completed'] += 1
+            elif status in ['FAILED', 'CANCELLED', 'TIMEOUT']:
+                status_summary['failed'] += 1
+            else:
+                status_summary['other'] += 1
+        
+        # Return orchard job status in a unified format
+        return jsonify({
+            "job_id": job_id,
+            "status": "orchard_monitoring",
+            "type": "orchard_batch",
+            "total_jobs": len(all_jobs),
+            "status_summary": status_summary,
+            "slurm_jobs": all_jobs,
+            "timestamp": time.time(),
+            "message": "This is an orchard batch job. Use individual SLURM job IDs for detailed logs."
+        })
+    else:
         return jsonify({"error": "Job not found"}), 404
     
-    # Get number of log lines to return (default 20)
-    num_lines = request.args.get('log_lines', 20, type=int)
-    
-    job_info = job_results[job_id]
+    # Continue with regular job processing for non-orchard jobs...
     
     if "slurm_job_id" in job_info:
         slurm_job_id = job_info["slurm_job_id"]
@@ -1746,7 +2608,404 @@ def cleanup_job(job_id):
     
     return jsonify({"message": f"Job {job_id} cleaned up successfully"})
 
+@app.route('/deposit_pdb_cluster', methods=['POST'])
+def upload_pdb_to_cluster():
+    """Upload a PDB file to the cluster in a secure location.
+    
+    Expected form data:
+        - pdb_file: The PDB file to upload
+        - pdb_id: A unique identifier for this PDB file
+    
+    Returns:
+        JSON with upload status and remote file path
+    """
+    try:
+        # Check if we have cluster configuration
+        if not CLUSTER_CONFIG.get("use_remote_cluster", False):
+            return jsonify({
+                "error": "Remote cluster not configured",
+                "message": "This endpoint requires remote cluster configuration"
+            }), 400
+        
+        # Validate form data
+        if 'pdb_file' not in request.files:
+            return jsonify({"error": "No PDB file provided"}), 400
+        
+        if 'pdb_id' not in request.form:
+            return jsonify({"error": "No PDB ID provided"}), 400
+        
+        pdb_file = request.files['pdb_file']
+        pdb_id = request.form['pdb_id'].strip()
+        
+        # Validate file
+        if pdb_file.filename == '':
+            return jsonify({"error": "No file selected"}), 400
+        
+        # Validate PDB ID (sanitize for security)
+        if not pdb_id or not re.match(r'^[a-zA-Z0-9_-]+$', pdb_id):
+            return jsonify({
+                "error": "Invalid PDB ID",
+                "message": "PDB ID must contain only alphanumeric characters, underscores, and hyphens"
+            }), 400
+        
+        # Check file extension
+        if not pdb_file.filename.lower().endswith(('.pdb', '.cif')):
+            return jsonify({
+                "error": "Invalid file type",
+                "message": "File must have .pdb or .cif extension"
+            }), 400
+        
+        # Connect to cluster
+        if not ssh_cluster.client:
+            if not ssh_cluster.connect():
+                return jsonify({
+                    "error": "Could not connect to cluster",
+                    "message": "SSH connection failed"
+                }), 500
+        
+        # Create secure paths - use predictions_base_dir for uploaded PDBs
+        predictions_base_dir = ORCHARD_CONFIG.get("paths", {}).get("predictions_base_dir", "/tmp/boltz2_predictions")
+        remote_pdb_dir = f"{predictions_base_dir}/uploaded_pdbs"
+        
+        # Create filename with timestamp for uniqueness
+        timestamp = int(time.time())
+        original_filename = pdb_file.filename
+        file_extension = os.path.splitext(original_filename)[1]
+        secure_filename = f"{pdb_id}_{timestamp}{file_extension}"
+        remote_file_path = f"{remote_pdb_dir}/{secure_filename}"
+        
+        # Create temporary local file
+        local_temp_dir = Path("./temp_uploads")
+        local_temp_dir.mkdir(exist_ok=True)
+        local_temp_file = local_temp_dir / secure_filename
+        
+        try:
+            # Save file locally first
+            pdb_file.save(str(local_temp_file))
+            
+            # Verify it's a valid PDB/CIF file by checking first few lines
+            with open(local_temp_file, 'r') as f:
+                first_lines = [f.readline().strip() for _ in range(5)]
+            
+            # Basic validation for PDB/CIF format
+            is_pdb = any(line.startswith(('HEADER', 'ATOM', 'HETATM', 'MODEL')) for line in first_lines)
+            is_cif = any(line.startswith(('data_', 'loop_', '_atom_site')) for line in first_lines)
+            
+            if not (is_pdb or is_cif):
+                return jsonify({
+                    "error": "Invalid file format",
+                    "message": "File does not appear to be a valid PDB or CIF file"
+                }), 400
+            
+            # Ensure remote directory exists
+            ssh_cluster.execute_command(f"mkdir -p {remote_pdb_dir}")
+            
+            # Upload file to cluster
+            if not ssh_cluster.upload_file(str(local_temp_file), remote_file_path):
+                return jsonify({
+                    "error": "Upload failed",
+                    "message": "Could not upload file to cluster"
+                }), 500
+            
+            # Verify upload by checking file exists and getting size
+            exit_code, stdout, stderr = ssh_cluster.execute_command(f"ls -la {remote_file_path}")
+            
+            if exit_code != 0:
+                return jsonify({
+                    "error": "Upload verification failed",
+                    "message": "File was not found on cluster after upload"
+                }), 500
+            
+            # Parse file info
+            file_info = stdout.strip().split()
+            file_size = file_info[4] if len(file_info) > 4 else "unknown"
+            
+            # Set secure permissions (owner read/write only)
+            ssh_cluster.execute_command(f"chmod 600 {remote_file_path}")
+            
+            return jsonify({
+                "status": "success",
+                "message": "PDB file uploaded successfully",
+                "pdb_id": pdb_id,
+                "original_filename": original_filename,
+                "remote_path": remote_file_path,
+                "secure_filename": secure_filename,
+                "file_size": file_size,
+                "upload_timestamp": timestamp,
+                "file_type": "cif" if is_cif else "pdb"
+            })
+            
+        finally:
+            # Clean up local temporary file
+            if local_temp_file.exists():
+                local_temp_file.unlink()
+                
+    except Exception as e:
+        return jsonify({
+            "error": "Upload failed",
+            "message": str(e)
+        }), 500
+
+
+@app.route('/cleanup', methods=['POST'])
+def cleanup_remote_files():
+    """Clean up temporary files from the remote cluster.
+    
+    Removes files from:
+    - chembl_id_files/ (or protein_id_files/)
+    - scripts/
+    - logs/
+    - Any other temporary files specified
+    
+    Request body (optional):
+    {
+        "confirm": true,  # Required for safety
+        "directories": ["chembl_id_files", "protein_id_files", "scripts", "logs"],  # Optional - defaults to all
+        "dry_run": false  # If true, only shows what would be deleted without actually deleting
+    }
+    """
+    try:
+        # Check if remote cluster is configured
+        if not CLUSTER_CONFIG.get("use_remote_cluster", False):
+            return jsonify({
+                "error": "Remote cluster not configured",
+                "message": "This endpoint requires remote cluster configuration"
+            }), 400
+        
+        data = request.json or {}
+        
+        # Safety check - require explicit confirmation
+        if not data.get("confirm", False):
+            return jsonify({
+                "error": "Confirmation required",
+                "message": "Set 'confirm': true in request body to proceed with cleanup",
+                "warning": "This will permanently delete temporary files on the remote cluster"
+            }), 400
+        
+        dry_run = data.get("dry_run", False)
+        
+        # Get the remote work directory
+        remote_work_dir = CLUSTER_CONFIG.get("remote_work_dir", "/home/rmacknig/boltz2_api_remote")
+        
+        # Default directories to clean
+        default_dirs = ["chembl_id_files", "protein_id_files", "scripts", "logs"]
+        directories_to_clean = data.get("directories", default_dirs)
+        
+        # Connect to cluster
+        if not ssh_cluster.client:
+            if not ssh_cluster.connect():
+                return jsonify({
+                    "error": "Could not connect to cluster",
+                    "message": "SSH connection failed"
+                }), 500
+        
+        cleanup_results = []
+        total_files_removed = 0
+        total_size_freed = 0
+        
+        for directory in directories_to_clean:
+            dir_path = f"{remote_work_dir}/{directory}"
+            
+            try:
+                # Check if directory exists
+                exit_code, stdout, stderr = ssh_cluster.execute_command(f"test -d {dir_path} && echo 'exists'")
+                if stdout.strip() != 'exists':
+                    cleanup_results.append({
+                        "directory": directory,
+                        "path": dir_path,
+                        "status": "not_found",
+                        "message": "Directory does not exist"
+                    })
+                    continue
+                
+                # Get file count and size before cleanup
+                exit_code, stdout, stderr = ssh_cluster.execute_command(
+                    f"find {dir_path} -type f | wc -l"
+                )
+                file_count = int(stdout.strip()) if exit_code == 0 and stdout.strip() else 0
+                
+                exit_code, stdout, stderr = ssh_cluster.execute_command(
+                    f"du -sb {dir_path} | cut -f1"
+                )
+                dir_size = int(stdout.strip()) if exit_code == 0 and stdout.strip() else 0
+                
+                if dry_run:
+                    # Dry run - just show what would be deleted
+                    exit_code, stdout, stderr = ssh_cluster.execute_command(
+                        f"find {dir_path} -type f -name '*' | head -10"
+                    )
+                    sample_files = stdout.strip().split('\n') if stdout.strip() else []
+                    
+                    cleanup_results.append({
+                        "directory": directory,
+                        "path": dir_path,
+                        "status": "dry_run",
+                        "files_to_delete": file_count,
+                        "size_bytes": dir_size,
+                        "sample_files": sample_files,
+                        "message": f"Would delete {file_count} files ({dir_size} bytes)"
+                    })
+                else:
+                    # Actually clean the directory
+                    exit_code, stdout, stderr = ssh_cluster.execute_command(
+                        f"find {dir_path} -type f -delete"
+                    )
+                    
+                    if exit_code == 0:
+                        cleanup_results.append({
+                            "directory": directory,
+                            "path": dir_path,
+                            "status": "cleaned",
+                            "files_removed": file_count,
+                            "size_freed_bytes": dir_size,
+                            "message": f"Successfully deleted {file_count} files ({dir_size} bytes)"
+                        })
+                        total_files_removed += file_count
+                        total_size_freed += dir_size
+                    else:
+                        cleanup_results.append({
+                            "directory": directory,
+                            "path": dir_path,
+                            "status": "error",
+                            "error": stderr.strip(),
+                            "message": f"Failed to clean directory: {stderr.strip()}"
+                        })
+                        
+            except Exception as e:
+                cleanup_results.append({
+                    "directory": directory,
+                    "path": dir_path,
+                    "status": "error",
+                    "error": str(e),
+                    "message": f"Error processing directory: {str(e)}"
+                })
+        
+        # Summary
+        successful_cleanups = len([r for r in cleanup_results if r.get("status") == "cleaned"])
+        failed_cleanups = len([r for r in cleanup_results if r.get("status") == "error"])
+        
+        response = {
+            "status": "completed" if not dry_run else "dry_run",
+            "remote_work_dir": remote_work_dir,
+            "summary": {
+                "directories_processed": len(directories_to_clean),
+                "successful_cleanups": successful_cleanups,
+                "failed_cleanups": failed_cleanups,
+                "total_files_removed": total_files_removed,
+                "total_size_freed_bytes": total_size_freed,
+                "total_size_freed_mb": round(total_size_freed / (1024 * 1024), 2)
+            },
+            "details": cleanup_results,
+            "timestamp": time.time()
+        }
+        
+        if dry_run:
+            response["message"] = "Dry run completed - no files were actually deleted"
+        else:
+            response["message"] = f"Cleanup completed: {total_files_removed} files removed, {response['summary']['total_size_freed_mb']} MB freed"
+        
+        return jsonify(response)
+        
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "message": "Cleanup operation failed"
+        }), 500
+
+
+@app.route('/slurm_status/<slurm_job_id>', methods=['GET'])
+def get_simple_slurm_status(slurm_job_id):
+    """Get the status of a SLURM job directly by running squeue on the cluster.
+    
+    Args:
+        slurm_job_id: The SLURM job ID (e.g., "12345")
+    
+    Returns:
+        JSON with job status, or "finished" if not found in queue
+    """
+    try:
+        if CLUSTER_CONFIG.get("use_remote_cluster", False):
+            # SSH-based status check with automatic cleanup
+            # Use fresh connection to avoid file descriptor leaks with ProxyCommand
+            exit_code, stdout, stderr = execute_remote_command_with_cleanup(
+                f"squeue -j {slurm_job_id} --format='%i|%T|%M|%l|%D|%C|%R' --noheader",
+                timeout=30
+            )
+            
+            if exit_code == 0 and stdout.strip():
+                # Parse the output
+                parts = stdout.strip().split('|')
+                return jsonify({
+                    "slurm_job_id": slurm_job_id,
+                    "status": parts[1] if len(parts) > 1 else "UNKNOWN",
+                    "elapsed_time": parts[2] if len(parts) > 2 else "",
+                    "time_limit": parts[3] if len(parts) > 3 else "",
+                    "nodes": parts[4] if len(parts) > 4 else "",
+                    "cpus": parts[5] if len(parts) > 5 else "",
+                    "reason": parts[6] if len(parts) > 6 else "",
+                    "in_queue": True
+                })
+            else:
+                # Job not found in queue, it's finished
+                return jsonify({
+                    "slurm_job_id": slurm_job_id,
+                    "status": "FINISHED",
+                    "in_queue": False,
+                    "message": "Job not found in queue, likely completed"
+                })
+        else:
+            # Local status check
+            result = subprocess.run(
+                ["squeue", "-j", slurm_job_id, "--format=%i|%T|%M|%l|%D|%C|%R", "--noheader"],
+                capture_output=True,
+                text=True
+            )
+            
+            if result.returncode == 0 and result.stdout.strip():
+                # Parse the output
+                parts = result.stdout.strip().split('|')
+                return jsonify({
+                    "slurm_job_id": slurm_job_id,
+                    "status": parts[1] if len(parts) > 1 else "UNKNOWN",
+                    "elapsed_time": parts[2] if len(parts) > 2 else "",
+                    "time_limit": parts[3] if len(parts) > 3 else "",
+                    "nodes": parts[4] if len(parts) > 4 else "",
+                    "cpus": parts[5] if len(parts) > 5 else "",
+                    "reason": parts[6] if len(parts) > 6 else "",
+                    "in_queue": True
+                })
+            else:
+                # Job not found in queue
+                return jsonify({
+                    "slurm_job_id": slurm_job_id,
+                    "status": "FINISHED",
+                    "in_queue": False,
+                    "message": "Job not found in queue, likely completed"
+                })
+                
+    except Exception as e:
+        return jsonify({
+            "slurm_job_id": slurm_job_id,
+            "status": "ERROR",
+            "error": str(e)
+        }), 500
+
 if __name__ == '__main__':
+    # Initialize SSH connection pool
+    ssh_host_alias = os.getenv('BOLTZ_2_SSH_HOST_ALIAS')
+    if ssh_host_alias:
+        ssh_connection_pool = SSHConnectionPool(ssh_host_alias, pool_size=5)
+        app.config['SSH_POOL'] = ssh_connection_pool
+        print(f"✅ Initialized SSH connection pool for '{ssh_host_alias}' with 5 connections")
+    
+    # Get configuration from environment variables
+    host = os.getenv('BOLTZ_2_API_HOST', '0.0.0.0')
+    port = int(os.getenv('BOLTZ_2_API_PORT', '5001'))
+    debug = os.getenv('BOLTZ_2_API_DEBUG', 'true').lower() == 'true'
+    
     print(f"Starting Boltz-2 API with {NUM_GPUS} GPU(s): {AVAILABLE_GPUS}")
     print(f"Set NUM_GPUS environment variable to configure GPU count (default: 1)")
-    app.run(host='0.0.0.0', port=5000, debug=True) 
+    print(f"API will run on {host}:{port} (debug={debug})")
+    print(f"Configure with BOLTZ_2_API_HOST, BOLTZ_2_API_PORT, and BOLTZ_2_API_DEBUG environment variables")
+    app.run(host=host, port=port, debug=debug) 
